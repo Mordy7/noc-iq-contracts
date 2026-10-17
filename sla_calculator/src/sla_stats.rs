@@ -36,3 +36,48 @@ pub fn record_calculation(env: &Env, met: bool, penalty: i128) {
     }
     env.storage().instance().set(&STATS_KEY, &stats);
 }
+
+/// Aggregate `(success, failure)` counts: SLAs met and SLAs violated.
+pub fn get_success_failure_counts(env: &Env) -> (u64, u64) {
+    let stats = get_stats(env);
+    (stats.met_count, stats.violation_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SLACalculatorContract;
+
+    #[test]
+    fn test_counts_start_at_zero() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || assert_eq!(get_success_failure_counts(&env), (0, 0)));
+    }
+
+    #[test]
+    fn test_counts_track_successes_and_failures_separately() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || {
+            record_calculation(&env, true, 0);
+            record_calculation(&env, true, 0);
+            record_calculation(&env, false, 250);
+            assert_eq!(get_success_failure_counts(&env), (2, 1));
+        });
+    }
+
+    #[test]
+    fn test_counts_sum_to_total_calculations() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || {
+            for i in 0..10u32 {
+                record_calculation(&env, i % 3 != 0, 10);
+            }
+            let (ok, bad) = get_success_failure_counts(&env);
+            assert_eq!(ok + bad, get_stats(&env).total_calculations);
+            assert_eq!((ok, bad), (6, 4));
+        });
+    }
+}

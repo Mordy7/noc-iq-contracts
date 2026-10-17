@@ -11,6 +11,8 @@ pub const EXPECTED_SCHEMA_VERSION: u32 = 1;
 pub enum IntegrityIssue {
     MissingKey,
     SchemaVersionMismatch,
+    /// History holds more entries than the stats counter accounts for.
+    OrphanedHistory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,8 +60,33 @@ fn collect_version_issues(env: &Env) -> Vec<IntegrityIssue> {
     issues
 }
 
+/// Number of history entries not accounted for by the calculation counter.
+///
+/// Every history entry is written together with a stats increment, so
+/// `history.len() > stats.total_calculations` means entries were written
+/// without their counter update (e.g. after a partial failure). History may
+/// legitimately be *shorter* than the counter because of pruning.
+pub fn orphaned_history_entries(env: &Env) -> u32 {
+    let history: Vec<crate::SLAResult> = env
+        .storage()
+        .instance()
+        .get(&HISTORY_KEY)
+        .unwrap_or_else(|| Vec::new(env));
+    let counted: u64 = env
+        .storage()
+        .instance()
+        .get::<Symbol, crate::SLAStats>(&STATS_KEY)
+        .map(|s| s.total_calculations)
+        .unwrap_or(0);
+    let counted = counted.min(u32::MAX as u64) as u32;
+    history.len().saturating_sub(counted)
+}
+
 pub fn integrity_check(env: &Env) -> IntegrityReport {
     let mut issues = collect_missing(env);
+    if orphaned_history_entries(env) > 0 {
+        issues.push_back(IntegrityIssue::OrphanedHistory);
+    }
     for issue in collect_version_issues(env) {
         issues.push_back(issue);
     }
@@ -149,5 +176,121 @@ mod tests {
     #[test]
     fn essential_keys_cover_config_stats_history_and_version() {
         assert_eq!(essential_keys().len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod orphan_and_partial_failure_tests {
+    use super::*;
+    use crate::{SLAResult, SLAStats, SLACalculatorContract};
+    use soroban_sdk::{BytesN, Vec};
+
+    fn entry(env: &Env, n: u64) -> SLAResult {
+        SLAResult {
+            outage_id: symbol_short!("o"),
+            status: symbol_short!("met"),
+            mttr_minutes: 5,
+            threshold_minutes: 30,
+            amount: 10,
+            payment_type: symbol_short!("rew"),
+            rating: symbol_short!("good"),
+            config_version_hash: BytesN::from_array(env, &[0u8; 32]),
+            recorded_at: n,
+        }
+    }
+
+    fn write_history(env: &Env, count: u64) {
+        let mut h: Vec<SLAResult> = Vec::new(env);
+        for n in 0..count {
+            h.push_back(entry(env, n));
+        }
+        env.storage().instance().set(&HISTORY_KEY, &h);
+    }
+
+    fn write_counter(env: &Env, calcs: u64) {
+        env.storage().instance().set(
+            &STATS_KEY,
+            &SLAStats {
+                total_calculations: calcs,
+                total_violations: 0,
+                total_rewards: 0,
+                total_penalties: 0,
+            },
+        );
+    }
+
+    fn seed_persistent(env: &Env) {
+        let store = env.storage().persistent();
+        store.set(&CONFIG_KEY, &1u32);
+        store.set(&STATS_KEY, &2u32);
+        store.set(&HISTORY_KEY, &3u32);
+        store.set(&SCHEMA_VERSION_KEY, &EXPECTED_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_no_orphans_when_history_matches_the_counter() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || {
+            write_history(&env, 3);
+            write_counter(&env, 3);
+            assert_eq!(orphaned_history_entries(&env), 0);
+        });
+    }
+
+    #[test]
+    fn test_pruned_history_is_not_an_orphan() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || {
+            write_history(&env, 2);
+            write_counter(&env, 10);
+            assert_eq!(orphaned_history_entries(&env), 0);
+        });
+    }
+
+    #[test]
+    fn test_history_written_without_its_counter_update_is_orphaned() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || {
+            seed_persistent(&env);
+            write_history(&env, 5);
+            write_counter(&env, 3); // partial failure: counter lagged behind
+            assert_eq!(orphaned_history_entries(&env), 2);
+            let report = integrity_check(&env);
+            assert!(!report.is_healthy());
+            assert_eq!(report.issues.get(0), Some(IntegrityIssue::OrphanedHistory));
+        });
+    }
+
+    #[test]
+    fn test_integrity_recovers_once_the_partial_write_is_repaired() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || {
+            seed_persistent(&env);
+            write_history(&env, 5);
+            write_counter(&env, 3);
+            assert!(!integrity_check(&env).is_healthy());
+            write_counter(&env, 5);
+            assert!(integrity_check(&env).is_healthy());
+        });
+    }
+
+    #[test]
+    fn test_a_lost_key_after_a_partial_failure_is_reported_without_masking_others() {
+        let env = Env::default();
+        let id = env.register_contract(None, SLACalculatorContract);
+        env.as_contract(&id, || {
+            seed_persistent(&env);
+            env.storage().persistent().remove(&CONFIG_KEY);
+            write_history(&env, 4);
+            write_counter(&env, 1);
+            let report = integrity_check(&env);
+            assert_eq!(report.issue_count(), 2);
+            assert_eq!(report.issues.get(0), Some(IntegrityIssue::MissingKey));
+            assert_eq!(report.issues.get(1), Some(IntegrityIssue::OrphanedHistory));
+        });
     }
 }

@@ -24,6 +24,8 @@ pub mod cross_contract_safety;
 pub mod dependency_propagation;
 pub mod event_correlation;
 pub mod event_log_compaction;
+pub mod severity_enum;
+pub mod sla_stats;
 pub mod event_payload_guard;
 pub mod event_schema;
 pub mod event_ttl_refresh;
